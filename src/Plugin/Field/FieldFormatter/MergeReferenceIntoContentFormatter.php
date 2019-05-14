@@ -1,37 +1,57 @@
 <?php
 
-namespace Drupal\reference_as_fields_formatter\Plugin\Field\FieldFormatter;
+namespace Drupal\reference_as_field\Plugin\Field\FieldFormatter;
 
 use Drupal\Component\Utility\SortArray;
-use Drupal\Core\Entity\EntityManagerInterface;
-use Drupal\Core\Field\FieldItemInterface;
-use Drupal\Core\Field\FieldItemListInterface;
-use Drupal\Core\Field\FormatterBase;
+use Drupal\Core\Entity\{
+  Display\EntityViewDisplayInterface,
+  EntityInterface,
+  EntityTypeManagerInterface,
+  EntityManager
+};
+use Drupal\Core\Config\Entity\ConfigEntityStorageInterface;
+use Drupal\Core\Field\{
+  FieldDefinitionInterface,
+  FieldItemInterface,
+  FieldItemList,
+  FieldItemListInterface,
+  FormatterBase
+};
 use Drupal\Core\Form\FormStateInterface;
-use Drupal\Core\Field\FieldDefinitionInterface;
+use Drupal\Core\Logger\LoggerChannelFactoryInterface;
 use Drupal\Core\Plugin\ContainerFactoryPluginInterface;
-use Drupal\Core\Entity\EntityManager;
 use Drupal\Core\Cache\CacheableMetadata;
+use Drupal\typed_data\Exception\InvalidArgumentException;
 use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException;
+use Drupal\Component\Plugin\Exception\PluginNotFoundException;
 
 /**
- * Plugin implementation of the 'raff_merge_into_content_formatter' formatter.
+ * Plugin implementation of the reference_as_field formatter.
  *
  * @FieldFormatter(
  *   id = "merge_into_content_formatter",
  *   label = @Translation("Fields in parent content"),
  *   field_types = {
  *     "entity_reference",
- *     "entity_reference_revisions"
+ *     "entity_reference_revisions",
+ *     "dynamic_entity_reference"
  *   }
  * )
  */
 class MergeReferenceIntoContentFormatter extends FormatterBase implements ContainerFactoryPluginInterface {
 
   /**
-   * @var EntityManager
+   * @var EntityTypeManager
    */
   protected $entityManager;
+
+  /**
+   * The logger factory.
+   *
+   * @var \Drupal\Core\Logger\LoggerChannelFactoryInterface
+   */
+  protected $loggerFactory;
 
   /**
    * Constructs a MergeReferenceIntoContentFormatter object.
@@ -50,18 +70,54 @@ class MergeReferenceIntoContentFormatter extends FormatterBase implements Contai
    *   The view mode.
    * @param array $third_party_settings
    *   Any third party settings.
-   * @param EntityManagerInterface $entity_manager
+   * @param EntityTypeManagerInterface $entity_manager
+   * @param LoggerChannelFactoryInterface $logger_factory
+   *   A logger instance.
    */
-  public function __construct($plugin_id, $plugin_definition, FieldDefinitionInterface $field_definition, array $settings, $label, $view_mode, array $third_party_settings, EntityManagerInterface $entity_manager) {
+  public function __construct($plugin_id,
+                              $plugin_definition,
+                              FieldDefinitionInterface $field_definition,
+                              array $settings,
+                              $label,
+                              $view_mode,
+                              array $third_party_settings,
+                              EntityTypeManagerInterface $entity_manager,
+                              LoggerChannelFactoryInterface $logger_factory) {
     parent::__construct($plugin_id, $plugin_definition, $field_definition, $settings, $label, $view_mode, $third_party_settings);
     $this->entityManager = $entity_manager;
+    $this->loggerFactory = $logger_factory;
   }
 
+  /**
+   * {@inheritdoc}
+   */
+  public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
+    return new static(
+      $plugin_id,
+      $plugin_definition,
+      $configuration['field_definition'],
+      $configuration['settings'],
+      $configuration['label'],
+      $configuration['view_mode'],
+      $configuration['third_party_settings'],
+      $container->get('entity.manager'),
+      $container->get('logger.factory')
+    );
+  }
 
+  /**
+   * Create the display settings subform for the Entity Display form.
+   *
+   * @param array $form
+   * @param \Drupal\Core\Form\FormStateInterface $form_state
+   * @return array
+   */
   public function settingsForm(array $form, FormStateInterface $form_state) {
+    $elements = parent::settingsForm($form, $form_state);
+
     $view_modes = $this->getConfigurableViewModes();
     if (!empty($view_modes)) {
-      $form['view_mode'] = [
+      $elements['view_mode'] = [
         '#title' => t('View Mode'),
         '#description' => t('Select the view mode which will control which fields are shown and the display settings of those fields.'),
         '#type' => 'select',
@@ -69,64 +125,90 @@ class MergeReferenceIntoContentFormatter extends FormatterBase implements Contai
         '#options' => $view_modes,
       ];
     }
-    $form['show_entity_label'] = [
+
+    $elements['show_entity_label'] = [
       '#title' => t('Display Entity Label'),
       '#description' => t('Should the label of the target entity be displayed in the table?'),
       '#type' => 'checkbox',
       '#default_value' => $this->getSetting('show_entity_label'),
     ];
 
-    return $form;
+    return $elements;
   }
-
-  public function settingsSummary() {
-    $return = ['#markup' => $this->t('Fields are rendered in @view_mode view-mode.', ['@view_mode' => $this->getSetting('view_mode')])];
-    if ($this->getSetting('show_entity_label')) {
-      $return['#markup'] .= ' ' . $this->t('with a label');
-    }
-    return $return;
-  }
-
 
   /**
-   * {@inheritdoc}
+   * Return the settings summary (text) for a collapsed field Entity Display form.
+   *
+   * @return array|string[]
+   */
+  public function settingsSummary() {
+    $summary = [];
+    $summary[] = $this->t('Render with @view_mode view mode.',
+                          ['@view_mode' => $this->getSetting('view_mode')]);
+
+    if ($this->getSetting('show_entity_label')) {
+      $summary[] = $this->t('With a label.');
+    }
+    else {
+      $summary[] = $this->t('Without a label.');
+    }
+    return $summary;
+  }
+
+  /**
+   * @param FieldItemListInterface $items
+   * @param string $langcode
+   *
+   * @return array
+   *
+   * @throws InvalidPluginDefinitionException
+   * @throws PluginNotFoundException
    */
   public function viewElements(FieldItemListInterface $items, $langcode) {
     $output = [];
-    if ($entities = $this->getEntitiesForViewing($items, $langcode)) {
-      $fieldDefinition = $items[0]->getFieldDefinition();
-      $output += $this->getRenderArray($this->getTargetEntityId($fieldDefinition), $this->getTargetBundleId($fieldDefinition), $entities);
+    if ($items->count() == 0) {
+      return $output;
+    }
+    $entities = $this->getEntitiesForViewing($items, $langcode);
+    if ($entities) {
+      $output = $this->getRenderArray($entities);
       $this->buildCacheMetadata($entities)->applyTo($output);
     }
     return $output;
   }
 
-
   /**
-   * @param $type
-   * @param $bundle
-   * @param $view_mode
    *
-   * @return \Drupal\Core\Entity\EntityInterface
+   * @param string $langcode
+   * @param FieldItemListInterface $items
+   *
+   * @return EntityInterface[]
+   *
+   * @todo Deal with langcode!
    */
-  public function getRendererForDisplay($type, $bundle, $view_mode) {
-    $bundle = $bundle ?: $type;
-    $storage = $this->entityManager->getStorage('entity_view_display');
-    $renderer = $storage->load(implode('.', [$type, $bundle, $view_mode]));
-    if (!$renderer) {
-      $renderer = $storage->load(implode('.', [$type, $bundle, 'default']));
+  public function getEntitiesForViewing(FieldItemListInterface $items, $langcode = '') {
+    try {
+      $entity_type = $this->getTargetEntityId($this->fieldDefinition);
+      if (!$entity_type) {
+        $this->loggerFactory->get('reference_as_field')
+          ->error($this->t('Could not find target entity in @name (@type).', [
+            '@name' => $this->fieldDefinition->getName(),
+            '@type' => $this->fieldDefinition->getType()
+          ]));
+        return [];
+      }
+      $entity_storage = $this->entityManager->getStorage($entity_type);
     }
-    return $renderer;
-  }
+    catch (InvalidPluginDefinitionException | PluginNotFoundException $pnfe) { // PHP >=7.1
+      $this->loggerFactory->get('reference_as_field')
+        ->error($this->t('Bad Plugin / not found: @mess', ['@mess' => $pnfe->getMessage()]));
+      return [];
+    }
 
-
-  public function getEntitiesForViewing(FieldItemListInterface $items) {
-    $entity_type = $this->getTargetEntityId($this->fieldDefinition);
-    $entity_storage = $this->entityManager->getStorage($entity_type);
     $entities = [];
     foreach ($items as $item) {
       $entity = $entity_storage->load($this->getEntityIdFromFieldItem($item));
-      if ($entity->access('view')) {
+      if (isset($entity) && $entity->access('view')) {
         $entities[] = $entity;
       }
     }
@@ -134,28 +216,78 @@ class MergeReferenceIntoContentFormatter extends FormatterBase implements Contai
   }
 
   /**
+   * Return the view renderer for the entity
+   *
+   * @param EntityInterface $entity
+   * @param string $view_mode
+   *
+   * @return \Drupal\Core\Entity\Display\EntityViewDisplayInterface|\Drupal\Core\Entity\EntityInterface|null
+   * @throws \Drupal\Component\Plugin\Exception\InvalidPluginDefinitionException
+   * @throws \Drupal\Component\Plugin\Exception\PluginNotFoundException
+   */
+  public function getRendererForEntity($entity, $view_mode) {
+
+    $entity_type_id = $entity->getEntityTypeId();
+    $bundle = $entity->bundle();
+    $part = "{$entity_type_id}.{$bundle}";
+
+    /** @var ConfigEntityStorageInterface $storage */
+    $storage = $this->entityManager->getStorage('entity_view_display');
+
+    /** @var EntityViewDisplayInterface $renderer */
+    $renderer = $storage->load("{$part}.{$view_mode}");
+    if (!$renderer) {
+      $renderer = $storage->load("{$part}.default");
+    }
+
+    if ($renderer === NULL) {
+      $this->loggerFactory->get('reference_as_field')
+        ->error($this->t('Unable to render referenced entities: renderer not found for @type.@bundle.' . $view_mode, [
+          '@type' => $entity_type_id,
+          '@bundle' => $bundle
+        ]));
+    }
+    return $renderer;
+  }
+
+  /**
    * Get the render array for the given entities.
    *
-   * @param $type
-   * @param $bundle
    * @param $entities
+   *   The loaded entities.
    *
    * @return array
+   *   A Render array.
+   *
+   * @throws InvalidPluginDefinitionException
+   * @throws PluginNotFoundException
    */
-  public function getRenderArray($type, $bundle, $entities) {
-    $displayRenderer = $this->getRendererForDisplay($type, $bundle, $this->getSetting('view_mode'));
-    $renderCandidates = $displayRenderer->buildMultiple($entities);
-    $renderCandidates = reset($renderCandidates);
-    $renderCandidates = array_filter($renderCandidates, [
-      $this,
-      'fieldIsRenderableContent',
-    ]);
-    if (!$this->getSetting('show_entity_label')) {
-      $labelField = $this->entityManager->getDefinition($type)->getKey('label');
-      unset($renderCandidates[$labelField]);
+  public function getRenderArray($entities) {
+    $view_mode = $this->getSetting('view_mode');
+
+    $render_list = [];
+    foreach ($entities as $key => $entity) {
+      $renderer = $this->getRendererForEntity($entity, $view_mode);
+      if ($renderer) {
+        $rendered = $renderer->build($entity);
+
+        if (!$this->getSetting('show_entity_label')) {
+
+          // Get the base entity definition to find out which field, if any,
+          // is the entity label... e.g. "Node" label is "title".
+          $entityDefinition = $this->entityManager->getDefinition($entity->getEntityTypeId());
+          $labelField = $entityDefinition->getKey('label');
+          if ($labelField) {
+            unset($rendered[$labelField]);
+          }
+        }
+        uasort($rendered, [SortArray::class, 'sortByWeightProperty',]);
+
+        $render_list[$key] = $rendered;
+      }
     }
-    uasort($renderCandidates, [SortArray::class, 'sortByWeightProperty',]);
-    return $renderCandidates;
+
+    return $render_list;
   }
 
   /**
@@ -166,7 +298,7 @@ class MergeReferenceIntoContentFormatter extends FormatterBase implements Contai
   public function buildCacheMetadata($entities) {
     $cache_metadata = new CacheableMetadata();
     foreach ($entities as $entity) {
-      // Todo check if the entity is needed for viewing so the cache tags make some sense
+      // @todo check if the entity is needed for viewing so the cache tags make some sense
       $cache_metadata->addCacheableDependency($entity);
       $cache_metadata->addCacheableDependency($entity->access('view', NULL, TRUE));
     }
@@ -175,57 +307,67 @@ class MergeReferenceIntoContentFormatter extends FormatterBase implements Contai
   }
 
   /**
-   * @param \Drupal\Core\Field\FieldDefinitionInterface $field_definition
+   * @param FieldDefinitionInterface $field_definition
    *
    * @return array|mixed
-   * @throws \Exception
+   * @throws InvalidArgumentException
    */
   protected function getTargetBundleId(FieldDefinitionInterface $field_definition) {
-    $fieldDefinitionSettings = $field_definition->getSettings();
-    if (strpos($fieldDefinitionSettings['handler'], 'default') === 0) {
-      // Default to the first bundle, currently only supporting a single bundle.
-      $target_bundle = array_values($fieldDefinitionSettings['handler_settings']['target_bundles']);
-      $target_bundle = array_shift($target_bundle);
-    }
-    else {
-      throw new \Exception('Using non-default reference handlers are not supported');
-    }
-    return $target_bundle;
+    return $field_definition->getTargetBundle();
   }
-
 
   /**
    * Check if the field is renderable.
-   * Todo Check if this actually is enough.
    *
-   * @param $field
+   * @param array $field
    *
    * @return bool
+   * @todo Check if this actually is enough.
+   *
    */
   protected function fieldIsRenderableContent($field) {
-    return (isset($field['#items']) && ($field['#items']->getFieldDefinition()
-        ->getDisplayOptions('view')));
+    /** @var FieldItemList $field ['#items'] */
+    return (
+      isset($field['#items'])
+      && $field['#items']->getFieldDefinition()->getDisplayOptions('view')
+    );
   }
 
   /**
-   * @return array
+   * {@inheritdoc}
    */
   protected function getConfigurableViewModes() {
     return $this->entityManager->getViewModeOptions($this->getTargetEntityId($this->fieldDefinition));
   }
 
   /**
-   * @param \Drupal\Core\Field\FieldDefinitionInterface $field_definition
+   * @param FieldDefinitionInterface $field_definition
    *
    * @return mixed
    */
   protected function getTargetEntityId(FieldDefinitionInterface $field_definition) {
-    return $field_definition->getFieldStorageDefinition()
-      ->getSetting('target_type');
+    $storage_def = $field_definition->getFieldStorageDefinition();
+    if ($storage_def) {
+      // entity_reference:
+      $target = $storage_def->getSetting('target_type');
+      if ($target) {
+        return $target;
+      }
+      // dynamic_entity_reference:
+      $target = $storage_def->getSetting('entity_type_ids');
+      if ($target) {
+        return reset($target);
+      }
+    }
+    $this->loggerFactory->get('reference_as_field')
+      ->error($this->t('No target entity type specified for field @name (@type).', [
+        '@name' => $field_definition->getName(),
+        '@type' => $field_definition->getType()
+      ]));
   }
 
   /**
-   * @param \Drupal\Core\Field\FieldItemInterface $item
+   * @param FieldItemInterface $item
    *
    * @return mixed
    */
@@ -233,19 +375,9 @@ class MergeReferenceIntoContentFormatter extends FormatterBase implements Contai
     return $item->getValue()['target_id'];
   }
 
-  public static function create(ContainerInterface $container, array $configuration, $plugin_id, $plugin_definition) {
-    return new static(
-      $plugin_id,
-      $plugin_definition,
-      $configuration['field_definition'],
-      $configuration['settings'],
-      $configuration['label'],
-      $configuration['view_mode'],
-      $configuration['third_party_settings'],
-      $container->get('entity.manager')
-    );
-  }
-
+  /**
+   * {@inheritdoc}
+   */
   public static function defaultSettings() {
     return [
       'view_mode' => 'default',
